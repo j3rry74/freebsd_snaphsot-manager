@@ -1,0 +1,83 @@
+#
+# SNAPSHOT-MANAGER - Fichier de configuration
+# ============================================
+#
+# Ce fichier definit les datasets a gerer et leurs politiques de snapshots.
+#
+
+# ============================================================================
+# PARAMETRES GLOBAUX
+# ============================================================================
+
+# Chemin du fichier de log
+LOG_FILE=/var/log/snapshot-manager.log
+
+# Taille maximale du log avant rotation (en octets, 10 MB par defaut)
+LOG_MAX_SIZE=10485760
+
+# Suppression automatique des snapshots expires
+# yes = suppression automatique
+# no  = liste les snapshots a supprimer (mode manuel)
+AUTO_DELETE=no
+
+# ============================================================================
+# DEFINITION DES DATASETS
+# ============================================================================
+#
+# Format:
+#   DATASET:<nom_dataset>:<politique>:<retention>:<unite>:<active>
+#
+# Champs:
+#   - nom_dataset : chemin complet du dataset ZFS (ex: mypool/Documents)
+#   - politique   : daily, weekly, monthly, quarterly
+#   - retention   : nombre d'unites a conserver
+#   - unite       : days, months, years
+#   - active      : yes ou no
+#
+# Politiques de snapshots:
+#   - daily      : @daily_YYYY-MM-DD      (ex: @daily_2024-12-26)
+#   - weekly     : @weekly_YYYY-MM-DD     (date du lundi, ex: @weekly_2024-12-23)
+#   - monthly    : @monthly_YYYY-MM       (ex: @monthly_2024-12)
+#   - quarterly  : @quarterly_YYYY-MM     (mois 01, 04, 07, 10, ex: @quarterly_2024-10)
+#
+# Exemples de retention:
+#   - 30 days   = 30 jours
+#   - 3 months  = 3 mois
+#   - 1 years   = 1 an
+#
+
+# ----------------------------------------------------------------------------
+# VOS DATASETS
+# ----------------------------------------------------------------------------
+
+# Administratif - Snapshot journalier, retention 1 mois
+DATASET:mypool/Administratif:daily:30:days:yes
+
+# Camescope - Snapshot mensuel, retention 1 an
+DATASET:mypool/Camescope:monthly:12:months:yes
+
+# CoffreFort - Snapshot hebdomadaire, retention 3 mois
+DATASET:mypool/CoffreFort:weekly:3:months:yes
+
+# Documents - Snapshot hebdomadaire, retention 1 mois
+DATASET:mypool/Documents:weekly:30:days:yes
+
+# Musique - Snapshot trimestriel, retention 1 an
+DATASET:mypool/Musique:quarterly:12:months:yes
+
+# Photos - Snapshot mensuel, retention 1 an
+DATASET:mypool/Photos:monthly:12:months:yes
+
+# Users - Snapshot hebdomadaire, retention 3 mois
+DATASET:mypool/Users:weekly:3:months:yes
+
+# ----------------------------------------------------------------------------
+# DATASETS DESACTIVES (exemples)
+# ----------------------------------------------------------------------------
+# Pour desactiver temporairement un dataset, mettez "no" en dernier champ
+# DATASET:mypool/Backup:daily:7:days:no
+# DATASET:mypool/Temp:weekly:2:weeks:no
+
+# ============================================================================
+# FIN DE LA CONFIGURATION
+# ============================================================================
