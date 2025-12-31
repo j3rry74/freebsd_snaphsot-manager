@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC3043  # 'local' is supported in FreeBSD sh
 #
 # snapshot-manager.sh - Gestionnaire intelligent de snapshots ZFS
 # Pour FreeNAS/FreeBSD avec support cold storage (NAS pas toujours allume)
@@ -148,7 +149,7 @@ get_monday_of_week() {
 # Usage: date_minus_days <nombre_jours>
 date_minus_days() {
     local days="$1"
-    date -v-${days}d "+%Y-%m-%d" 2>/dev/null || \
+    date -v-"${days}"d "+%Y-%m-%d" 2>/dev/null || \
     date -d "-${days} days" "+%Y-%m-%d" 2>/dev/null
 }
 
@@ -156,7 +157,7 @@ date_minus_days() {
 # Usage: date_minus_months <nombre_mois>
 date_minus_months() {
     local months="$1"
-    date -v-${months}m "+%Y-%m" 2>/dev/null || \
+    date -v-"${months}"m "+%Y-%m" 2>/dev/null || \
     date -d "-${months} months" "+%Y-%m" 2>/dev/null
 }
 
@@ -313,6 +314,19 @@ get_snapshot_date() {
     echo "$snapshot_name" | sed 's/@[a-z]*_//'
 }
 
+# Compare deux dates (format YYYY-MM-DD ou YYYY-MM)
+# Retourne 0 si date1 < date2, 1 sinon
+# Usage: date_is_before <date1> <date2>
+date_is_before() {
+    local date1="$1"
+    local date2="$2"
+    # Convertir en nombre comparable (retirer les tirets)
+    local num1 num2
+    num1=$(echo "$date1" | tr -d '-')
+    num2=$(echo "$date2" | tr -d '-')
+    [ "$num1" -lt "$num2" ]
+}
+
 # ============================================================================
 # GESTION DE LA RETENTION
 # ============================================================================
@@ -363,7 +377,7 @@ get_expired_snapshots() {
     list_snapshots "$dataset" "$prefix" | while read -r snap; do
         local snap_date
         snap_date=$(get_snapshot_date "$snap")
-        if [ "$snap_date" \< "$cutoff_date" ]; then
+        if date_is_before "$snap_date" "$cutoff_date"; then
             echo "$snap"
         fi
     done
@@ -506,19 +520,22 @@ cmd_status() {
     echo "SNAPSHOTS EXPIRES (a supprimer):"
     echo "--------------------------------"
 
-    local has_expired=0
-    get_datasets | while read -r dataset; do
-        if [ -n "$dataset" ]; then
-            get_expired_snapshots "$dataset" | while read -r snap; do
-                if [ -n "$snap" ]; then
-                    has_expired=1
-                    echo "  ${dataset}${snap}"
-                fi
-            done
-        fi
-    done
+    local expired_list
+    expired_list=$(
+        get_datasets | while read -r dataset; do
+            if [ -n "$dataset" ]; then
+                get_expired_snapshots "$dataset" | while read -r snap; do
+                    if [ -n "$snap" ]; then
+                        echo "  ${dataset}${snap}"
+                    fi
+                done
+            fi
+        done
+    )
 
-    if [ "$has_expired" -eq 0 ]; then
+    if [ -n "$expired_list" ]; then
+        echo "$expired_list"
+    else
         echo "  (aucun)"
     fi
 
