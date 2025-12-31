@@ -28,6 +28,9 @@ SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 CONFIG_FILE="${SCRIPT_DIR}/config.txt"
 LOG_FILE="/var/log/snapshot-manager.log"
 LOG_MAX_SIZE=10485760  # 10 MB
+LOCK_FILE="/var/run/snapshot-manager.lock"
+MIN_KEEP=1  # Nombre minimum de snapshots a conserver par dataset
+AUTO_DELETE=no  # Suppression automatique des snapshots expires (yes/no)
 DRY_RUN=0
 VERBOSE=0
 FORCE=0
@@ -83,6 +86,46 @@ rotate_log() {
 # Verifie si une commande existe
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# Acquiert le verrou pour eviter les executions concurrentes
+acquire_lock() {
+    if [ -f "$LOCK_FILE" ]; then
+        local pid
+        pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log ERROR "Une autre instance est deja en cours (PID: $pid)"
+            return 1
+        else
+            log WARN "Fichier lock orphelin detecte, suppression"
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+    trap 'release_lock' EXIT INT TERM
+    log DEBUG "Verrou acquis (PID: $$)"
+    return 0
+}
+
+# Libere le verrou
+release_lock() {
+    rm -f "$LOCK_FILE"
+    log DEBUG "Verrou libere"
+}
+
+# Verifie la coherence de l'horloge systeme
+check_system_clock() {
+    local current_year
+    current_year=$(date "+%Y")
+
+    # Verifier que l'annee est raisonnable (entre 2020 et 2100)
+    if [ "$current_year" -lt 2020 ] || [ "$current_year" -gt 2100 ]; then
+        log ERROR "Horloge systeme incoherente (annee: $current_year). Abandon par securite."
+        return 1
+    fi
+
+    log DEBUG "Horloge systeme OK (annee: $current_year)"
+    return 0
 }
 
 # ============================================================================
@@ -165,15 +208,42 @@ date_minus_months() {
 # FONCTIONS DE CONFIGURATION
 # ============================================================================
 
-# Charge et valide la configuration
+# Lit une valeur de configuration de maniere securisee
+# Usage: get_config_value <variable_name>
+get_config_value() {
+    local var_name="$1"
+    grep -E "^${var_name}=" "$CONFIG_FILE" | grep -v "^#" | head -1 | cut -d= -f2 | tr -d ' '
+}
+
+# Charge et valide la configuration (sans eval pour la securite)
 load_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         log ERROR "Fichier de configuration non trouve: $CONFIG_FILE"
         return 1
     fi
 
-    # Charger les variables globales du config
-    eval "$(grep -E "^(LOG_FILE|LOG_MAX_SIZE|AUTO_DELETE)=" "$CONFIG_FILE" | grep -v "^#")"
+    # Charger les variables globales du config de maniere securisee
+    local val
+
+    val=$(get_config_value "LOG_FILE")
+    if [ -n "$val" ]; then
+        LOG_FILE="$val"
+    fi
+
+    val=$(get_config_value "LOG_MAX_SIZE")
+    if [ -n "$val" ]; then
+        LOG_MAX_SIZE="$val"
+    fi
+
+    val=$(get_config_value "AUTO_DELETE")
+    if [ -n "$val" ]; then
+        AUTO_DELETE="$val"
+    fi
+
+    val=$(get_config_value "MIN_KEEP")
+    if [ -n "$val" ]; then
+        MIN_KEEP="$val"
+    fi
 
     log DEBUG "Configuration chargee depuis $CONFIG_FILE"
     return 0
@@ -331,7 +401,16 @@ date_is_before() {
 # GESTION DE LA RETENTION
 # ============================================================================
 
+# Compte le nombre de snapshots d'un dataset avec un prefixe donne
+# Usage: count_snapshots <dataset> <prefix>
+count_snapshots() {
+    local dataset="$1"
+    local prefix="$2"
+    list_snapshots "$dataset" "$prefix" | wc -l | tr -d ' '
+}
+
 # Calcule les snapshots a supprimer selon la politique de retention
+# Respecte MIN_KEEP pour garantir un minimum de snapshots
 # Usage: get_expired_snapshots <dataset>
 get_expired_snapshots() {
     local dataset="$1"
@@ -371,14 +450,46 @@ get_expired_snapshots() {
             ;;
     esac
 
+    # SECURITE: Verifier que cutoff_date est valide
+    if [ -z "$cutoff_date" ]; then
+        log ERROR "Impossible de calculer la date limite pour $dataset. Abandon du nettoyage."
+        return 1
+    fi
+
+    # Verifier le format de la date (doit contenir des chiffres et tirets)
+    case "$cutoff_date" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]*)
+            ;;
+        *)
+            log ERROR "Format de date limite invalide: '$cutoff_date'. Abandon du nettoyage."
+            return 1
+            ;;
+    esac
+
     log DEBUG "Dataset: $dataset, Politique: $policy, Retention: $retention $unit, Date limite: $cutoff_date"
 
-    # Lister les snapshots expires
+    # Compter le nombre total de snapshots
+    local total_snapshots
+    total_snapshots=$(count_snapshots "$dataset" "$prefix")
+
+    # SECURITE: Respecter MIN_KEEP
+    local can_delete=$((total_snapshots - MIN_KEEP))
+    if [ "$can_delete" -le 0 ]; then
+        log DEBUG "Dataset $dataset: seulement $total_snapshots snapshot(s), MIN_KEEP=$MIN_KEEP, aucune suppression"
+        return 0
+    fi
+
+    # Lister les snapshots expires (en respectant MIN_KEEP)
+    local expired_count=0
     list_snapshots "$dataset" "$prefix" | while read -r snap; do
+        if [ "$expired_count" -ge "$can_delete" ]; then
+            break
+        fi
         local snap_date
         snap_date=$(get_snapshot_date "$snap")
         if date_is_before "$snap_date" "$cutoff_date"; then
             echo "$snap"
+            expired_count=$((expired_count + 1))
         fi
     done
 }
@@ -387,16 +498,10 @@ get_expired_snapshots() {
 # Usage: cleanup_dataset <dataset>
 cleanup_dataset() {
     local dataset="$1"
-    local auto_delete
-
-    auto_delete=$(grep "^AUTO_DELETE=" "$CONFIG_FILE" | cut -d= -f2 | tr -d ' ')
-
-    local expired_count=0
 
     get_expired_snapshots "$dataset" | while read -r snap; do
         if [ -n "$snap" ]; then
-            expired_count=$((expired_count + 1))
-            if [ "$auto_delete" = "yes" ]; then
+            if [ "$AUTO_DELETE" = "yes" ]; then
                 delete_snapshot "$dataset" "$snap"
             else
                 log INFO "Snapshot expire (suppression manuelle requise): ${dataset}${snap}"
@@ -439,6 +544,7 @@ cmd_run() {
 process_dataset() {
     local dataset="$1"
     local policy snapshot_name
+    local snapshot_ok=0  # Flag pour savoir si on peut faire le nettoyage
 
     if ! dataset_exists "$dataset"; then
         log WARN "Dataset non trouve dans ZFS: $dataset"
@@ -465,12 +571,21 @@ process_dataset() {
         else
             log DEBUG "Snapshot existe deja: ${dataset}${snapshot_name}"
         fi
+        snapshot_ok=1  # Snapshot existe, on peut nettoyer
     else
-        create_snapshot "$dataset" "$snapshot_name"
+        # Creer le snapshot et verifier le succes
+        if create_snapshot "$dataset" "$snapshot_name"; then
+            snapshot_ok=1
+        else
+            log ERROR "Echec de creation du snapshot pour $dataset - nettoyage annule par securite"
+            snapshot_ok=0
+        fi
     fi
 
-    # Nettoyage des snapshots expires
-    cleanup_dataset "$dataset"
+    # SECURITE: Nettoyage UNIQUEMENT si le snapshot actuel est OK
+    if [ "$snapshot_ok" -eq 1 ]; then
+        cleanup_dataset "$dataset"
+    fi
 }
 
 # Commande: status
@@ -706,6 +821,13 @@ main() {
     # Executer la commande
     case "$command" in
         run)
+            # Verifications de securite avant execution
+            if ! check_system_clock; then
+                exit 1
+            fi
+            if ! acquire_lock; then
+                exit 1
+            fi
             cmd_run "$argument"
             ;;
         status)
