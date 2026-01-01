@@ -20,6 +20,10 @@ LOG_MAX_SIZE=10485760
 # no  = liste les snapshots a supprimer (mode manuel)
 AUTO_DELETE=no
 
+# Nombre minimum de snapshots a conserver par dataset (securite)
+# Meme si les snapshots sont expires, on en garde au minimum ce nombre
+MIN_KEEP=1
+
 # ============================================================================
 # DEFINITION DES DATASETS
 # ============================================================================
