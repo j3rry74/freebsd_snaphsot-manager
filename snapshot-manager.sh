@@ -210,9 +210,78 @@ date_minus_months() {
 
 # Lit une valeur de configuration de maniere securisee
 # Usage: get_config_value <variable_name>
+# Note: Utilise grep -F pour eviter l'injection regex
 get_config_value() {
     local var_name="$1"
-    grep -E "^${var_name}=" "$CONFIG_FILE" | grep -v "^#" | head -1 | cut -d= -f2 | tr -d ' '
+    # grep -F pour match litteral, cut -d= -f2- pour garder tout apres le premier =
+    grep -F "${var_name}=" "$CONFIG_FILE" | grep "^${var_name}=" | head -1 | cut -d= -f2-
+}
+
+# Valide qu'une valeur est un entier positif
+# Usage: validate_positive_int <value> <var_name>
+validate_positive_int() {
+    local val="$1"
+    local var_name="$2"
+    case "$val" in
+        ''|*[!0-9]*)
+            log ERROR "Configuration invalide: $var_name doit etre un entier positif (valeur: '$val')"
+            return 1
+            ;;
+        *)
+            if [ "$val" -le 0 ]; then
+                log ERROR "Configuration invalide: $var_name doit etre > 0 (valeur: '$val')"
+                return 1
+            fi
+            return 0
+            ;;
+    esac
+}
+
+# Valide qu'une valeur est un entier >= 0
+# Usage: validate_non_negative_int <value> <var_name>
+validate_non_negative_int() {
+    local val="$1"
+    local var_name="$2"
+    case "$val" in
+        ''|*[!0-9]*)
+            log ERROR "Configuration invalide: $var_name doit etre un entier >= 0 (valeur: '$val')"
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# Valide qu'une valeur est yes ou no
+# Usage: validate_yes_no <value> <var_name>
+validate_yes_no() {
+    local val="$1"
+    local var_name="$2"
+    case "$val" in
+        yes|no)
+            return 0
+            ;;
+        *)
+            log ERROR "Configuration invalide: $var_name doit etre 'yes' ou 'no' (valeur: '$val')"
+            return 1
+            ;;
+    esac
+}
+
+# Valide qu'une valeur est dans une liste
+# Usage: validate_enum <value> <var_name> <val1> <val2> ...
+validate_enum() {
+    local val="$1"
+    local var_name="$2"
+    shift 2
+    for allowed in "$@"; do
+        if [ "$val" = "$allowed" ]; then
+            return 0
+        fi
+    done
+    log ERROR "Configuration invalide: $var_name doit etre parmi: $* (valeur: '$val')"
+    return 1
 }
 
 # Charge et valide la configuration (sans eval pour la securite)
@@ -222,64 +291,188 @@ load_config() {
         return 1
     fi
 
-    # Charger les variables globales du config de maniere securisee
-    local val
+    if [ ! -r "$CONFIG_FILE" ]; then
+        log ERROR "Fichier de configuration non lisible: $CONFIG_FILE"
+        return 1
+    fi
 
+    local val
+    local config_valid=1
+
+    # LOG_FILE (chemin, pas de validation stricte mais on verifie le repertoire parent)
     val=$(get_config_value "LOG_FILE")
     if [ -n "$val" ]; then
+        local log_dir
+        log_dir=$(dirname "$val")
+        if [ ! -d "$log_dir" ]; then
+            log WARN "Repertoire de log inexistant: $log_dir"
+        fi
         LOG_FILE="$val"
     fi
 
+    # LOG_MAX_SIZE (entier positif)
     val=$(get_config_value "LOG_MAX_SIZE")
     if [ -n "$val" ]; then
-        LOG_MAX_SIZE="$val"
+        if validate_positive_int "$val" "LOG_MAX_SIZE"; then
+            LOG_MAX_SIZE="$val"
+        else
+            config_valid=0
+        fi
     fi
 
+    # AUTO_DELETE (yes/no)
     val=$(get_config_value "AUTO_DELETE")
     if [ -n "$val" ]; then
-        AUTO_DELETE="$val"
+        if validate_yes_no "$val" "AUTO_DELETE"; then
+            AUTO_DELETE="$val"
+        else
+            config_valid=0
+        fi
     fi
 
+    # MIN_KEEP (entier >= 0)
     val=$(get_config_value "MIN_KEEP")
     if [ -n "$val" ]; then
-        MIN_KEEP="$val"
+        if validate_non_negative_int "$val" "MIN_KEEP"; then
+            MIN_KEEP="$val"
+        else
+            config_valid=0
+        fi
+    fi
+
+    if [ "$config_valid" -eq 0 ]; then
+        log ERROR "Configuration invalide, abandon"
+        return 1
     fi
 
     log DEBUG "Configuration chargee depuis $CONFIG_FILE"
     return 0
 }
 
-# Retourne la liste des datasets actifs
+# Valide une ligne DATASET et retourne le nombre de champs
+# Format attendu: DATASET:<dataset>:<policy>:<retention>:<unit>:<enabled>
+# Usage: validate_dataset_line <line>
+validate_dataset_line() {
+    local line="$1"
+    local field_count
+    field_count=$(echo "$line" | tr -cd ':' | wc -c)
+    # 6 champs = 5 separateurs ":"
+    if [ "$field_count" -ne 5 ]; then
+        log WARN "Ligne DATASET malformee (attendu 6 champs, trouve $((field_count + 1))): $line"
+        return 1
+    fi
+    return 0
+}
+
+# Retourne la ligne de config d'un dataset (recherche exacte, pas de regex)
+# Usage: get_dataset_line <dataset>
+get_dataset_line() {
+    local dataset="$1"
+    # Utilise grep -F pour match litteral, puis filtre pour match exact
+    grep -F "DATASET:${dataset}:" "$CONFIG_FILE" | grep "^DATASET:${dataset}:" | head -1
+}
+
+# Retourne la liste des datasets actifs avec validation
 get_datasets() {
-    grep -E "^DATASET:" "$CONFIG_FILE" | while read -r line; do
-        local dataset enabled
-        dataset=$(echo "$line" | cut -d: -f2 | tr -d ' ')
-        enabled=$(echo "$line" | cut -d: -f6 | tr -d ' ')
+    grep "^DATASET:" "$CONFIG_FILE" | while read -r line; do
+        # Valider le format de la ligne
+        if ! validate_dataset_line "$line"; then
+            continue
+        fi
+
+        local dataset enabled policy retention unit
+        dataset=$(echo "$line" | cut -d: -f2)
+        policy=$(echo "$line" | cut -d: -f3)
+        retention=$(echo "$line" | cut -d: -f4)
+        unit=$(echo "$line" | cut -d: -f5)
+        enabled=$(echo "$line" | cut -d: -f6)
+
+        # Supprimer les espaces
+        dataset=$(echo "$dataset" | tr -d ' ')
+        policy=$(echo "$policy" | tr -d ' ')
+        retention=$(echo "$retention" | tr -d ' ')
+        unit=$(echo "$unit" | tr -d ' ')
+        enabled=$(echo "$enabled" | tr -d ' ')
+
+        # Valider les champs
+        if [ -z "$dataset" ]; then
+            log WARN "Dataset vide dans la ligne: $line"
+            continue
+        fi
+
+        if ! validate_enum "$policy" "policy" daily weekly monthly quarterly 2>/dev/null; then
+            log WARN "Politique invalide '$policy' pour dataset $dataset"
+            continue
+        fi
+
+        if ! validate_positive_int "$retention" "retention" 2>/dev/null; then
+            log WARN "Retention invalide '$retention' pour dataset $dataset"
+            continue
+        fi
+
+        if ! validate_enum "$unit" "unit" days months years 2>/dev/null; then
+            log WARN "Unite invalide '$unit' pour dataset $dataset"
+            continue
+        fi
+
         if [ "$enabled" = "yes" ]; then
             echo "$dataset"
         fi
     done
 }
 
-# Retourne la politique d'un dataset
+# Retourne la politique d'un dataset (avec validation)
 # Usage: get_policy <dataset>
 get_policy() {
     local dataset="$1"
-    grep -E "^DATASET:${dataset}:" "$CONFIG_FILE" | cut -d: -f3 | tr -d ' '
+    local line policy
+    line=$(get_dataset_line "$dataset")
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    policy=$(echo "$line" | cut -d: -f3 | tr -d ' ')
+    if validate_enum "$policy" "policy" daily weekly monthly quarterly 2>/dev/null; then
+        echo "$policy"
+    else
+        log ERROR "Politique invalide pour $dataset: $policy"
+        return 1
+    fi
 }
 
-# Retourne la retention d'un dataset (en jours ou mois selon la politique)
+# Retourne la retention d'un dataset (avec validation)
 # Usage: get_retention <dataset>
 get_retention() {
     local dataset="$1"
-    grep -E "^DATASET:${dataset}:" "$CONFIG_FILE" | cut -d: -f4 | tr -d ' '
+    local line retention
+    line=$(get_dataset_line "$dataset")
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    retention=$(echo "$line" | cut -d: -f4 | tr -d ' ')
+    if validate_positive_int "$retention" "retention" 2>/dev/null; then
+        echo "$retention"
+    else
+        log ERROR "Retention invalide pour $dataset: $retention"
+        return 1
+    fi
 }
 
-# Retourne l'unite de retention
+# Retourne l'unite de retention (avec validation)
 # Usage: get_retention_unit <dataset>
 get_retention_unit() {
     local dataset="$1"
-    grep -E "^DATASET:${dataset}:" "$CONFIG_FILE" | cut -d: -f5 | tr -d ' '
+    local line unit
+    line=$(get_dataset_line "$dataset")
+    if [ -z "$line" ]; then
+        return 1
+    fi
+    unit=$(echo "$line" | cut -d: -f5 | tr -d ' ')
+    if validate_enum "$unit" "unit" days months years 2>/dev/null; then
+        echo "$unit"
+    else
+        log ERROR "Unite invalide pour $dataset: $unit"
+        return 1
+    fi
 }
 
 # Verifie si un dataset existe dans ZFS
